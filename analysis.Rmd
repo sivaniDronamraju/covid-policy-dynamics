@@ -1,0 +1,511 @@
+---
+title: "COVID-19 Policy, Vaccination, and Outcome Dynamics in U.S. States"
+author: "Sivani Dronamraju"
+output: pdf_document
+geometry: margin=1in
+---
+
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+```
+
+# Introduction
+
+This analysis examines how COVID-19 policy strictness and vaccination uptake evolved across U.S. states and how those trajectories aligned with observed case and mortality patterns over time. The objective is not to attribute causality, but to surface meaningful state-level differences and temporal alignments under heterogeneous policy regimes and reporting constraints.
+
+The focus is deliberately narrow: large U.S. states with high cumulative case counts, where policy variation, population scale, and healthcare capacity create materially different outcome paths. The analysis prioritizes interpretability and judgment over model complexity.
+
+#### What this analysis does not attempt:
+- It does not estimate causal policy effects.
+- It does not evaluate policy “effectiveness” in isolation.
+- It does not produce an operational forecasting system.
+
+#### What it focuses on instead:
+- How policy stringency and vaccination uptake co-evolved across states
+- How outcome trajectories diverged and failed to reconverge
+- Where intuitive narratives (e.g., stricter policy to fewer cases) break down
+
+## Data Description
+
+The dataset, extracted with the COVID19 R package, includes state-level data (level = 2) from the COVID-19 Data Hub. A brief summary of the dataset's covariates can be found in the [COVID19 Data Hub documentation](https://covid19datahub.io/articles/docs.html). 
+
+#### The key features include:
+
+- Epidemiological outcomes: confirmed cases, deaths, hospitalizations, ICU occupancy
+- Vaccination metrics: people vaccinated, people fully vaccinated
+- Policy indices: stringency, containment & health, economic support
+- Demographics: population, geographic identifiers
+
+State-level granularity was chosen to balance policy heterogeneity with data availability, while avoiding over-interpretation of localized reporting noise.
+
+```{r}
+library(COVID19)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(zoo)
+library(forcats)
+library(leaflet)
+library(corrplot)
+library(lubridate)
+library(hexbin)
+library(gganimate)
+library(gifski)
+library(transformr)
+library(pROC)
+```
+
+```{r, include=FALSE}
+covid_data <- covid19(level = 2)
+covid_data
+```
+
+```{r, include=FALSE}
+```
+
+
+```{r, include=FALSE}
+# Check the structure of the data
+str(covid_data)
+
+# Get a summary of the data
+summary(covid_data)
+```
+
+
+```{r, include=FALSE}
+```
+
+To get an overview of the global situation, I identified the top 10 countries by total confirmed cases
+
+```{r, include=FALSE}
+# Top 10 countries by total confirmed cases
+top_countries <- covid_data %>%
+  group_by(administrative_area_level_1) %>%
+  summarise(total_cases = max(confirmed, na.rm = TRUE)) %>%
+  arrange(desc(total_cases)) %>%
+  head(10)
+
+top_countries
+```
+
+```{r}
+# Plot top 10 countries
+ggplot(top_countries, aes(x = reorder(administrative_area_level_1, -total_cases), y = total_cases)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Top 10 Countries by Total Confirmed Cases",
+       x = "Country", y = "Total Confirmed Cases") +
+  scale_y_continuous(labels = scales::comma)+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Global trend of cases over time
+global_trend <- covid_data %>%
+  group_by(date) %>%
+  summarise(total_cases = sum(confirmed, na.rm = TRUE),
+            total_deaths = sum(deaths, na.rm = TRUE))
+
+ggplot(global_trend, aes(x = date)) +
+  geom_line(aes(y = total_cases, color = "Confirmed Cases")) +
+  geom_line(aes(y = total_deaths, color = "Deaths")) +
+  scale_y_log10(labels = scales::comma) +
+  labs(title = "Global COVID-19 Trend",
+       x = "Date", y = "Count (Log Scale)", color = "Metric") +
+  theme_minimal()
+```
+
+## Scope Selection: U.S. State-Level Focus
+
+This analysis intentionally bypasses global comparisons and focuses directly on U.S. state-level dynamics. While global trends are well-documented, they add limited value for understanding how heterogeneous policy decisions, vaccination uptake, and healthcare capacity interacted within a single federal system.
+
+Restricting the scope to U.S. states allows for clearer comparisons under shared reporting standards, vaccine availability timelines, and broadly similar institutional constraints.
+
+
+```{r, include=FALSE}
+usa_data <- covid_data[covid_data$iso_alpha_3 == "USA", ]
+```
+
+
+## Data Preprocessing
+
+Preprocessing focused on isolating analysis-relevant signals while minimizing noise introduced by reporting gaps, jurisdictional inconsistencies, and redundant variables. The steps below reflect deliberate scoping decisions rather than exhaustive data cleaning.
+
+```{r}
+missing_pct <- colMeans(is.na(usa_data)) * 100
+missing_pct
+```
+
+Variables with structurally high missingness (e.g., early hospitalization and vaccination metrics) were retained only where temporal coverage was sufficient to support comparative analysis.
+
+```{r}
+# Normalize state identifier and exclude non-state jurisdictions
+
+usa_data <- usa_data %>%
+rename(state = administrative_area_level_2) %>%
+filter(!state %in% c(
+"Northern Mariana Islands", "Virgin Islands", "Guam",
+"American Samoa", "District of Columbia", "Puerto Rico"
+))
+```
+
+```{r, include=FALSE}
+unique(usa_data$state)
+```
+
+- To focus solely on U.S. states, I removed territories and the District of Columbia
+
+```{r, include=FALSE}
+unique(usa_data$state)
+```
+
+```{r, include=FALSE}
+# Retain analysis-relevant variables only
+
+usa_data <- usa_data %>%
+select(
+date, state, population,
+confirmed, deaths, hosp, icu,
+vaccines, people_fully_vaccinated,
+stringency_index, government_response_index,
+containment_health_index, economic_support_index,
+school_closing, workplace_closing,
+stay_home_restrictions, testing_policy, vaccination_policy,
+latitude, longitude
+)
+```
+
+```{r}
+# Derived metric used to reason about vaccination coverage gaps
+
+usa_data <- usa_data %>%
+mutate(people_not_vaccinated = population - people_fully_vaccinated)
+```
+
+This preprocessing yields a state-level panel aligned to the core analytical questions like how policy strictness, vaccination uptake, and healthcare strain evolved together over time.
+
+
+## Handling Missing Values
+
+COVID-19 data is incomplete by nature, reporting practices changed over time, metrics were introduced gradually, and not all states reported the same fields consistently. Rather than attempting to reconstruct missing values precisely, the goal here was to maintain continuity where trends matter, while avoiding artificial precision.
+
+
+
+
+```{r, include=FALSE}
+# Cumulative metrics should not decrease over time
+
+cumulative_cols <- c(
+"confirmed", "deaths", "vaccines",
+"people_fully_vaccinated", "people_not_vaccinated"
+)
+
+usa_data <- usa_data %>%
+group_by(state) %>%
+arrange(date) %>%
+fill(all_of(cumulative_cols), .direction = "downup") %>%
+ungroup()
+```
+
+For cumulative counts (e.g., cases, deaths, vaccinations), missing values were filled forward and backward within each state. This preserves monotonic trends without implying new events occurred on missing days.
+
+
+```{r, include=FALSE}
+# Policy indices stabilizing gaps without altering relative scale
+
+policy_index_cols <- c(
+"stringency_index",
+"government_response_index",
+"containment_health_index",
+"economic_support_index"
+)
+
+usa_data <- usa_data %>%
+mutate(across(
+all_of(policy_index_cols),
+~replace_na(., median(., na.rm = TRUE))
+))
+
+```
+
+Policy indices were imputed using median values to avoid breaking time series while preserving relative differences between states. These values are treated as stabilizers, not as exact estimates.
+
+```{r, include=FALSE}
+# Hospitalization data: state-aware fallback to global median
+
+overall_hosp_median <- median(usa_data$hosp, na.rm = TRUE)
+
+usa_data <- usa_data %>%
+group_by(state) %>%
+mutate(
+hosp = ifelse(
+is.na(hosp),
+ifelse(all(is.na(hosp)), overall_hosp_median, median(hosp, na.rm = TRUE)),
+hosp
+)
+) %>%
+ungroup()
+
+```
+
+Hospitalization and ICU data were handled conservatively. When a state reported some values, its own median was used; when a state never reported the metric, an overall median was used to avoid structural gaps in downstream analysis.
+
+
+```{r, include=FALSE}
+# Policy measures: preserve ordinal meaning while enabling comparison
+
+policy_cols <- c(
+"school_closing",
+"workplace_closing",
+"stay_home_restrictions",
+"testing_policy",
+"vaccination_policy"
+)
+
+usa_data <- usa_data %>%
+mutate(across(
+all_of(policy_cols),
+~factor(., ordered = TRUE)
+)) %>%
+mutate(across(
+all_of(policy_cols),
+list(
+scope = ~ifelse(as.numeric(.) >= 0, "General", "Targeted"),
+intensity = ~abs(as.numeric(.))
+),
+.names = "{.col}_{.fn}"
+))
+
+```
+
+Policy variables were treated as ordinal measures rather than continuous quantities. To make comparisons more interpretable, each policy was decomposed into a simple notion of scope (general vs targeted) and intensity, without assuming linear effects.
+ 
+
+```{r, include=FALSE}
+# ICU data handled analogously to hospitalization
+
+overall_icu_median <- median(usa_data$icu, na.rm = TRUE)
+
+usa_data <- usa_data %>%
+group_by(state) %>%
+mutate(
+icu = ifelse(
+is.na(icu),
+ifelse(all(is.na(icu)), overall_icu_median, median(icu, na.rm = TRUE)),
+icu
+)
+) %>%
+ungroup()
+
+```
+
+These choices prioritize interpretability and continuity over completeness. Missing-value handling here supports comparative reasoning, not precise estimation, and downstream results are interpreted with this limitation in mind.
+
+
+
+## Outcome Trajectories in High-Impact States
+
+Rather than aggregating outcomes into broad regions, the analysis focuses on the five U.S. states with the highest cumulative case counts. These states capture a wide range of population sizes, outbreak timing, and policy approaches, while keeping comparisons interpretable.
+
+```{r}
+# Identify top 5 states by cumulative confirmed cases
+
+top_5_states <- usa_data %>%
+group_by(state) %>%
+summarize(total_confirmed = max(confirmed, na.rm = TRUE)) %>%
+arrange(desc(total_confirmed)) %>%
+slice(1:5) %>%
+pull(state)
+
+```
+
+
+```{r include=FALSE}
+usa_data_top5 <- usa_data %>%
+filter(state %in% top_5_states)
+```
+
+```{r}
+# Death trajectories for top 5 states
+
+ggplot(
+usa_data_top5,
+aes(x = date, y = deaths, color = state)
+) +
+geom_line(size = 1) +
+scale_y_continuous(labels = scales::comma) +
+labs(
+title = "Cumulative COVID-19 Deaths in High-Impact States",
+x = "Date",
+y = "Cumulative Deaths",
+color = "State"
+) +
+theme_minimal() +
+theme(
+axis.text.x = element_text(angle = 45, hjust = 1),
+panel.grid.minor = element_blank()
+)
+```
+
+New York shows a sharp early increase in deaths, consistent with its role as an initial epicenter. In contrast, states such as Texas and Florida exhibit more gradual but sustained increases over a longer period. California’s trajectory reflects both early exposure and population scale, with multiple periods of accelerated growth corresponding to major infection waves.
+
+
+```{r}
+# Population-normalized impact metrics
+
+state_impact <- usa_data %>%
+group_by(state) %>%
+summarize(
+population = max(population, na.rm = TRUE),
+total_cases = max(confirmed, na.rm = TRUE),
+total_deaths = max(deaths, na.rm = TRUE),
+percent_affected = (total_cases / population) * 100,
+percent_died = (total_deaths / population) * 100
+)
+```
+
+Looking beyond raw counts, population-normalized metrics highlight a different pattern. States with the highest infection reach are not always those with the highest mortality burden. Smaller states such as Rhode Island and Alaska rank high in percentage affected, while mortality rates are more concentrated in parts of the South and Southwest, pointing to the role of demographic and healthcare factors beyond case volume alone.
+
+## Policy Strictness, Vaccination Uptake, and Outcome Alignment
+
+To understand how policy choices and vaccination rollout evolved alongside COVID-19 outcomes, the analysis focuses on the five U.S. states with the highest cumulative case counts. These states capture meaningful variation in timing, population scale, and policy posture under a shared national context.
+
+
+```{r}
+# Government response stringency over time
+
+ggplot(
+usa_data_top5,
+aes(x = date, y = stringency_index, color = state)
+) +
+geom_line() +
+labs(
+title = "Government Response Stringency in High-Impact States",
+x = "Date",
+y = "Stringency Index"
+) +
+scale_y_continuous(limits = c(0, 100)) +
+theme_minimal()
+```
+
+All five states implemented similarly strict measures during the initial phase of the pandemic in early 2020. Over time, policy paths diverged: New York and California maintained higher levels of restriction for longer periods, while Florida and Texas relaxed measures earlier. By late 2021, stringency levels converged across states, reflecting a broader shift toward managing COVID-19 under less restrictive policies.
+
+```{r}
+# Vaccination uptake over time
+
+vaccination_trends <- usa_data_top5 %>%
+mutate(vaccination_rate = (people_fully_vaccinated / population) * 100)
+
+ggplot(
+vaccination_trends,
+aes(x = date, y = vaccination_rate, color = state)
+) +
+geom_line() +
+geom_vline(
+xintercept = as.Date("2020-12-14"),
+linetype = "dashed",
+color = "gray"
+) +
+labs(
+title = "Vaccination Uptake in High-Impact States",
+x = "Date",
+y = "Percent Fully Vaccinated"
+) +
+scale_y_continuous(limits = c(0, 100)) +
+theme_minimal()
+
+```
+Vaccination uptake accelerated rapidly following vaccine availability in late 2020, but states diverged in their eventual coverage levels. New York and California reached higher vaccination plateaus than Florida and Texas, while Illinois followed an intermediate path. These trajectories reflect differences in timing, public response, and local implementation rather than a single explanatory factor.
+
+```{r}
+# Cross-sectional relationship between vaccination and case burden
+
+relationship_data <- usa_data_top5 %>%
+group_by(state) %>%
+summarize(
+vaccination_rate = max(people_fully_vaccinated, na.rm = TRUE) / max(population) * 100,
+cases_per_100k = (max(confirmed, na.rm = TRUE) / max(population)) * 100000,
+population = max(population)
+)
+
+ggplot(
+relationship_data,
+aes(x = vaccination_rate, y = cases_per_100k, color = state, size = population)
+) +
+geom_point(alpha = 0.7) +
+geom_smooth(method = "lm", linetype = "dashed", color = "black", se = FALSE) +
+labs(
+title = "Vaccination Coverage vs. Cumulative Case Burden",
+x = "Percent Fully Vaccinated",
+y = "Cases per 100,000 Population"
+) +
+theme_minimal()
+```
+Higher vaccination coverage does not correspond to lower cumulative case burden in this cross-sectional view. States with the highest vaccination rates also experienced substantial early exposure and multiple infection waves. This reinforces the importance of timing, population density, and early outbreak dynamics when interpreting aggregate outcomes, and highlights the limits of simple policy–outcome narratives.
+
+## Texas as a Case Study in Policy Timing and Outcome Interpretation
+
+Texas provides a useful contrast among high-impact states due to its relatively early relaxation of policy measures and distinct vaccination trajectory. Rather than treating Texas as an outlier to be explained away, this section uses it as a case study to highlight the limits of simple policy–outcome interpretations.
+
+
+```{r}
+# Policy indices over time for Texas
+
+ggplot(
+usa_data_top5 %>% filter(state == "Texas"),
+aes(x = date)
+) +
+geom_line(aes(y = stringency_index, color = "Stringency")) +
+geom_line(aes(y = containment_health_index, color = "Containment Health")) +
+geom_line(aes(y = economic_support_index, color = "Economic Support")) +
+labs(
+title = "Texas Policy Measures Over Time",
+x = "Date",
+y = "Index Value",
+color = "Policy Measure"
+) +
+theme_minimal()
+```
+Texas followed a similar initial policy response to other large states in early 2020, but reduced restrictions earlier and maintained lower levels of stringency through much of 2021 and beyond. Economic support measures show a brief increase in early 2023, but overall policy indices remained comparatively stable during later pandemic phases.
+
+```{r}
+# Vaccination rate vs cumulative case rate for Texas
+
+usa_data_top5 %>%
+filter(state == "Texas") %>%
+mutate(
+vaccination_rate = people_fully_vaccinated / population * 100,
+case_rate = confirmed / population * 100000
+) %>%
+filter(
+!is.na(vaccination_rate),
+!is.na(case_rate),
+is.finite(vaccination_rate),
+is.finite(case_rate)
+) %>%
+ggplot(aes(x = vaccination_rate, y = case_rate)) +
+geom_hex(bins = 30) +
+scale_fill_gradient(low = "#B4D8E7", high = "#F8B4B4") +
+labs(
+title = "Texas: Vaccination Coverage vs Cumulative Case Burden",
+x = "Percent Fully Vaccinated",
+y = "Cases per 100,000 Population",
+fill = "Observation Density"
+) +
+theme_minimal()
+```
+
+The bimodal structure reflects the cumulative nature of both vaccination rollout and case reporting. Higher vaccination rates coincide with higher cumulative case counts not because vaccination increases transmission, but because both metrics increase over time. Sparse observations at higher vaccination levels correspond to later stages of the pandemic, when cumulative case totals had already risen substantially.
+
+
+### How to Interpret these Results
+
+All findings in this analysis are descriptive and comparative. Observed alignments between policy measures, vaccination uptake, and outcomes reflect co-evolution over time rather than isolated effects. Differences across states should be interpreted as the result of interacting factors, including timing, population structure, healthcare capacity, and behavioral response, rather than as evidence for or against any single intervention.
+
+
+## Conclusion
+
+This analysis highlights how policy strictness, vaccination uptake, and COVID-19 outcomes evolved together, while also illustrating the limits of drawing simple causal conclusions from aggregate data. States with higher vaccination coverage and prolonged policy measures often experienced higher cumulative case counts due to early exposure, population scale, and repeated infection waves. 
+
+Rather than pointing to a single dominant factor, the results underscore the importance of timing, baseline conditions, and behavioral responses when interpreting pandemic outcomes. These findings emphasize the need for careful framing when using observational data to evaluate policy effectiveness.Sharp declines in reported cases and deaths toward the end of the timeline likely reflect reporting changes rather than true epidemiological shifts.
